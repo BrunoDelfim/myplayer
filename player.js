@@ -23,6 +23,24 @@ const colors = {
 // Histórico de vídeos reproduzidos nesta execução
 const playedVideos = new Set();
 
+// Detecta se o título do vídeo indica que é um álbum completo
+function isAlbumVideo(title) {
+    const albumPatterns = [
+        /\bfull album\b/i,
+        /\bcomplete album\b/i,
+        /\bentire album\b/i,
+        /\balbum completo\b/i,
+        /\bálbum completo\b/i,
+        /\bálbum inteiro\b/i,
+        /\bdisco completo\b/i,
+        /\bfull discography\b/i,
+        /\bdiscografia completa\b/i,
+        /\bfull lp\b/i
+    ];
+
+    return albumPatterns.some(pattern => pattern.test(title));
+}
+
 // Normaliza títulos para comparação
 function normalizeTitle(title) {
     return title
@@ -497,6 +515,10 @@ async function getRelatedVideos(videoId, currentTitle) {
                 }
 
                 if (areTitlesSimilar(currentTitle, video.title)) {
+                    return false;
+                }
+
+                if (isAlbumVideo(video.title)) {
                     return false;
                 }
 
