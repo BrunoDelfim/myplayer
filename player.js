@@ -2,6 +2,8 @@
 
 const { spawn, execFileSync } = require('child_process');
 const readline = require('readline');
+const net = require('net');
+const fs = require('fs');
 
 // Cores ANSI
 const colors = {
@@ -24,7 +26,31 @@ const colors = {
 const playedVideos = new Set();
 
 // Detecta se o título do vídeo indica que é um álbum completo
-function isAlbumVideo(title) {
+// Converte duração em segundos, aceitando números e formatos HH:MM:SS.
+function parseDuration(value) {
+    if (typeof value === 'number') {
+        return Number.isFinite(value) ? value : 0;
+    }
+
+    if (!value) return 0;
+
+    const text = String(value).trim();
+
+    if (/^\d+$/.test(text)) {
+        return Number(text);
+    }
+
+    const parts = text.split(':').map(Number);
+
+    if (parts.some(part => !Number.isFinite(part))) {
+        return 0;
+    }
+
+    return parts.reduce((total, part) => total * 60 + part, 0);
+}
+
+// Identifica álbuns completos e coletâneas longas.
+function isAlbumVideo(title, duration = 0) {
     const albumPatterns = [
         /\bfull album\b/i,
         /\bcomplete album\b/i,
@@ -38,7 +64,42 @@ function isAlbumVideo(title) {
         /\bfull lp\b/i
     ];
 
-    return albumPatterns.some(pattern => pattern.test(title));
+    if (albumPatterns.some(pattern => pattern.test(title))) {
+        return true;
+    }
+
+    const explicitCollectionPatterns = [
+        /\brecorda[cç][oõ]es\b/i,
+        /\bas antigas\b/i,
+        /\bas melhores\b/i,
+        /\bs[oó]\s+recorda[cç][oõ]es\b/i,
+        /\bmelhores\s+da\s+hist[oó]ria\b/i,
+        /\bgrandes\s+sucessos\b/i,
+        /\bsucessos\s+antigos\b/i
+    ];
+
+    if (explicitCollectionPatterns.some(pattern => pattern.test(title))) {
+        return true;
+    }
+
+    const collectionPatterns = [
+        /\bs[oó] as melhores\b/i,
+        /\bas melhores selecionadas\b/i,
+        /\bsele[cç][aã]o\b/i,
+        /\bselecionadas\b/i,
+        /\bgreatest hits\b/i,
+        /\bbest of\b/i,
+        /\bplaylist\b/i,
+        /\bcolet[aâ]nea\b/i,
+        /\bcompilado\b/i,
+        /\bdiscografia\b/i,
+        /\bmedley\b/i,
+        /\bnon.?stop\b/i,
+        /\bmix\b/i
+    ];
+
+    return duration > 720 &&
+        collectionPatterns.some(pattern => pattern.test(title));
 }
 
 // Normaliza títulos para comparação
@@ -202,16 +263,18 @@ function parseVideos(output) {
     const lines = output.split(/\r?\n/);
     const videos = [];
 
-    for (let i = 0; i + 2 < lines.length; i += 3) {
+    for (let i = 0; i + 3 < lines.length; i += 4) {
         const id = lines[i]?.trim();
         const title = lines[i + 1]?.trim();
         const uploader = lines[i + 2]?.trim();
+        const duration = parseDuration(lines[i + 3]?.trim());
 
         if (id && title) {
             videos.push({
                 id,
                 title,
-                uploader: uploader || 'Desconhecido'
+                uploader: uploader || 'Desconhecido',
+                duration
             });
         }
     }
@@ -226,6 +289,7 @@ async function searchVideos(query) {
         '--print', '%(id)s',
         '--print', '%(title)s',
         '--print', '%(uploader)s',
+        '--print', '%(duration)s',
         '--no-warnings',
         '--quiet'
     ]);
@@ -382,12 +446,19 @@ function selectVideo(videos, pageSize = 10) {
 function playMedia(videoUrl, title, uploader, hasVideoFlag) {
     return new Promise((resolve) => {
         console.log(`\n▶️ Reproduzindo: ${title} (${uploader})`);
-        console.log(`💡 (Pressione 'q' para pular para o próximo ou fechar)`);
+
+        const socketPath = `/tmp/myplayer-mpv-${process.pid}.sock`;
+
+        if (fs.existsSync(socketPath)) {
+            fs.unlinkSync(socketPath);
+        }
 
         const mpvArgs = [
             '--profile=fast',
             '--hwdec=vaapi',
-            '--gpu-api=opengl'
+            '--gpu-api=opengl',
+            `--input-ipc-server=${socketPath}`,
+            '--input-terminal=no'
         ];
 
         if (hasVideoFlag) {
@@ -395,7 +466,6 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
                 '--ytdl-format=bestvideo[height<=720][vcodec^=avc1]+bestaudio/best[height<=720]'
             );
 
-            // Silencia logs ruidosos de ffmpeg/vulkan
             mpvArgs.push(
                 '--msg-level=all=status,vd=error,ffmpeg/video=no,ffmpeg=no,vo/gpu-next/libplacebo=no'
             );
@@ -404,26 +474,203 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             mpvArgs.push('--ytdl-format=bestaudio');
         }
 
-        // Mantido conforme o comportamento original
         mpvArgs.push('--ytdl-raw-options=');
         mpvArgs.push(videoUrl);
 
         const mpv = spawn('mpv', mpvArgs, {
-            stdio: 'inherit',
+            stdio: ['ignore', 'inherit', 'inherit'],
             env: {
                 ...process.env,
                 LIBVA_DRIVER_NAME: 'i965'
             }
         });
 
+        let ipc = null;
         let finished = false;
+        let requestedAction = null;
+        let inputHandler = null;
+        let paused = false;
+        let ipcBuffer = '';
+        let requestId = 0;
+
+        const previousRawMode = Boolean(process.stdin.isRaw);
+
+        function sendCommand(command, id = null) {
+            if (!ipc || ipc.destroyed) return;
+
+            const message = { command };
+
+            if (id !== null) {
+                message.request_id = id;
+            }
+
+            ipc.write(JSON.stringify(message) + '\n');
+        }
+
+        function showVolume() {
+            const id = ++requestId;
+            sendCommand(['get_property', 'volume'], id);
+        }
+
+        function activateControls() {
+            if (!process.stdin.isTTY || !process.stdin.setRawMode) {
+                console.log(
+                    `${colors.yellow}⚠️ Terminal sem suporte aos controles interativos.${colors.reset}`
+                );
+                return;
+            }
+
+            readline.emitKeypressEvents(process.stdin);
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+
+            console.log(
+                `${colors.cyan}⌨️ Controles: n próximo | p pausar | r retomar | +/- volume | q voltar ao prompt${colors.reset}`
+            );
+
+            inputHandler = (str, key) => {
+                if (key?.ctrl && key.name === 'c') {
+                    requestedAction = 'quit';
+                    sendCommand(['quit']);
+                    return;
+                }
+
+                switch (str?.toLowerCase()) {
+                    case 'n':
+                        if (requestedAction) return;
+
+                        requestedAction = 'next';
+                        console.log('\n⏭️ Próximo vídeo solicitado...');
+                        sendCommand(['quit']);
+                        break;
+
+                    case 'p':
+                        if (paused) return;
+
+                        paused = true;
+                        sendCommand(['set_property', 'pause', true]);
+                        console.log('\n⏸️ Reprodução pausada.');
+                        break;
+
+                    case 'r':
+                        if (!paused) return;
+
+                        paused = false;
+                        sendCommand(['set_property', 'pause', false]);
+                        console.log('\n▶️ Reprodução retomada.');
+                        break;
+
+                    case '+':
+                        sendCommand(['add', 'volume', 5]);
+                        showVolume();
+                        break;
+
+                    case '-':
+                        sendCommand(['add', 'volume', -5]);
+                        showVolume();
+                        break;
+
+                    case 'q':
+                        if (requestedAction) return;
+
+                        requestedAction = 'quit';
+                        console.log(
+                            '\n⏹️ Encerrando reprodução e retornando ao prompt...'
+                        );
+                        sendCommand(['quit']);
+                        break;
+                }
+            };
+
+            process.stdin.on('keypress', inputHandler);
+        }
+
+        function connectIpc(attempt = 0) {
+            if (finished) return;
+
+            const client = net.createConnection(socketPath);
+
+            const onError = () => {
+                client.destroy();
+
+                if (attempt < 40 && !finished) {
+                    setTimeout(() => connectIpc(attempt + 1), 100);
+                } else if (!finished) {
+                    console.log(
+                        `${colors.red}❌ Não foi possível conectar aos controles do MPV.${colors.reset}`
+                    );
+                }
+            };
+
+            client.once('error', onError);
+
+            client.once('connect', () => {
+                client.removeListener('error', onError);
+
+                if (finished) {
+                    client.destroy();
+                    return;
+                }
+
+                ipc = client;
+                ipc.on('error', () => {});
+                ipc.on('data', (chunk) => {
+                    ipcBuffer += chunk.toString();
+
+                    const lines = ipcBuffer.split('\n');
+                    ipcBuffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+
+                        try {
+                            const response = JSON.parse(line);
+
+                            if (
+                                response.request_id &&
+                                response.error === 'success' &&
+                                typeof response.data === 'number'
+                            ) {
+                                console.log(
+                                    `\n🔊 Volume: ${Math.round(response.data)}%`
+                                );
+                            }
+                        } catch {
+                            // Ignora mensagens IPC inválidas.
+                        }
+                    }
+                });
+
+                activateControls();
+            });
+        }
 
         function finish(code) {
             if (finished) return;
             finished = true;
 
+            if (inputHandler) {
+                process.stdin.removeListener('keypress', inputHandler);
+            }
+
+            if (process.stdin.isTTY && process.stdin.setRawMode) {
+                process.stdin.setRawMode(previousRawMode);
+            }
+
+            if (ipc && !ipc.destroyed) {
+                ipc.destroy();
+            }
+
+            if (fs.existsSync(socketPath)) {
+                fs.unlinkSync(socketPath);
+            }
+
             console.log('\n🏁 Reprodução finalizada.');
-            resolve(code);
+
+            resolve({
+                code,
+                action: requestedAction
+            });
         }
 
         mpv.on('error', (error) => {
@@ -434,13 +681,13 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
         mpv.on('close', (code) => {
             finish(code);
         });
+
+        setTimeout(() => connectIpc(), 100);
     });
 }
 
-// Busca vídeos relacionados filtrando duplicatas
-
 // Busca recomendações contextuais diretamente do YouTube
-async function getRelatedVideos(videoId, currentTitle) {
+async function getRelatedVideos(videoId, currentTitle, isAudioMode) {
     try {
         const response = await fetch(
             'https://www.youtube.com/youtubei/v1/next?prettyPrint=false',
@@ -499,13 +746,16 @@ async function getRelatedVideos(videoId, currentTitle) {
                     'Desconhecido';
 
                 return {
-                    id: video.videoId ||
-                        video.endpoint?.watchEndpoint?.videoId,
+                    id: video.videoId || video.endpoint?.watchEndpoint?.videoId,
                     title,
-                    uploader
+                    uploader,
+                    duration: parseDuration(
+                        video.lengthText?.simpleText
+                    )
                 };
             })
             .filter(video => {
+
                 if (!video.id || playedVideos.has(video.id)) {
                     return false;
                 }
@@ -518,8 +768,15 @@ async function getRelatedVideos(videoId, currentTitle) {
                     return false;
                 }
 
-                if (isAlbumVideo(video.title)) {
-                    return false;
+                // Restrições exclusivas do modo áudio.
+                if (isAudioMode) {
+                    if (video.duration === 0 || video.duration > 900) {
+                        return false;
+                    }
+
+                    if (isAlbumVideo(video.title, video.duration)) {
+                        return false;
+                    }
                 }
 
                 return true;
@@ -540,18 +797,38 @@ async function getRelatedVideos(videoId, currentTitle) {
     }
 }
 
-function askCommand(mode) {
+function showHelp() {
+    console.log(`
+      ${colors.bold}${colors.cyan}────────────── MYPLAYER — AJUDA ──────────────${colors.reset}
+
+      ${colors.green}-a${colors.reset}             Ativar modo áudio
+      ${colors.magenta}-v${colors.reset}             Ativar modo vídeo
+      ${colors.green}-a consulta${colors.reset}   Pesquisar em modo áudio
+      ${colors.magenta}-v consulta${colors.reset}   Pesquisar em modo vídeo
+      ${colors.yellow}-h${colors.reset}             Exibir esta ajuda
+      ${colors.red}-q${colors.reset}             Encerrar o MyPlayer
+
+      ${colors.bold}Durante a reprodução:${colors.reset}
+      ${colors.green}n${colors.reset}  Próxima faixa
+      ${colors.green}p${colors.reset}  Pausar
+      ${colors.green}r${colors.reset}  Retomar
+      ${colors.green}+${colors.reset}  Aumentar volume
+      ${colors.green}-${colors.reset}  Diminuir volume
+      ${colors.green}q${colors.reset}  Voltar ao prompt
+
+      ${colors.gray}No prompt, letras sem prefixo são termos de pesquisa.${colors.reset}
+    `);
+}
+
+function askCommand() {
     return new Promise((resolve) => {
         const rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout
         });
 
-        const modeLabel = mode ? 'VÍDEO' : 'ÁUDIO';
-
         rl.question(
-            `\n${colors.bold}${colors.cyan}myplayer${colors.reset} ` +
-            `${colors.gray}[${modeLabel}]${colors.reset}> `,
+            `\n${colors.bold}${colors.cyan}myplayer${colors.reset}> `,
             (answer) => {
                 rl.close();
                 resolve(answer.trim());
@@ -622,31 +899,43 @@ async function main() {
                 const videoUrl =
                     `https://www.youtube.com/watch?v=${currentVideo.id}`;
 
-                const exitCode = await playMedia(
+                const playback = await playMedia(
                     videoUrl,
                     currentVideo.title,
                     currentVideo.uploader,
                     hasVideoFlag
                 );
 
-                if (exitCode !== 0) {
-                    if (exitCode !== null) {
+                // O usuário encerrou a sessão de reprodução.
+                if (playback.action === 'quit') {
+                    console.log('✓ Retornando ao MyPlayer.');
+                    break;
+                }
+
+                // Interrompe em caso de erro no MPV.
+                if (playback.action !== 'next' && playback.code !== 0) {
+                    if (playback.code !== null) {
                         console.log(
-                            `⚠️ MPV finalizado com código ${exitCode}.`
+                            `⚠️ MPV finalizado com código ${playback.code}.`
                         );
                     }
                     break;
                 }
 
-                console.log(
-                    '🔄 Buscando próximas sugestões reais (Autoplay)...'
-                );
+                if (playback.action === 'next') {
+                    console.log('⏭️ Buscando o próximo vídeo solicitado...');
+                } else {
+                    console.log(
+                        '🔄 Buscando próximas sugestões reais (Autoplay)...'
+                    );
+                }
 
                 const related = await withLoadingAnimation(
                     'Buscando recomendações do YouTube',
                     () => getRelatedVideos(
                         currentVideo.id,
-                        currentVideo.title
+                        currentVideo.title,
+                        !hasVideoFlag
                     )
                 );
 
@@ -679,9 +968,11 @@ async function main() {
     console.log(
         `\n${colors.bold}${colors.cyan}╭────────────── MYPLAYER ──────────────╮${colors.reset}`
     );
+
     console.log(
-        `${colors.bold}${colors.cyan}│${colors.reset}  ${colors.green}[A]${colors.reset} Áudio    ${colors.magenta}[V]${colors.reset} Vídeo    ${colors.red}[X]${colors.reset} Sair  ${colors.bold}${colors.cyan}│${colors.reset}`
+        `${colors.bold}${colors.cyan}│${colors.reset}  ${colors.green}[-A]${colors.reset} Áudio    ${colors.magenta}[-V]${colors.reset} Vídeo    ${colors.red}[-Q]${colors.reset} Sair  ${colors.bold}${colors.cyan}│${colors.reset}`
     );
+
     console.log(
         `${colors.bold}${colors.cyan}╰─────────────────────────────────────╯${colors.reset}`
     );
@@ -694,7 +985,7 @@ async function main() {
         if (firstRun && initialQuery) {
             command = initialQuery;
         } else {
-            command = await askCommand(hasVideoFlag);
+            command = await askCommand();
         }
 
         firstRun = false;
@@ -705,8 +996,14 @@ async function main() {
 
         const normalized = command.toLowerCase();
 
+        // Ajuda
+        if (normalized === '-h' || normalized === '--help') {
+            showHelp();
+            continue;
+        }
+
         // Encerrar
-        if (normalized === 'x') {
+        if (normalized === '-q' || normalized === '--quit') {
             console.log(
                 `\n${colors.green}👋 Até a próxima!${colors.reset}`
             );
@@ -714,22 +1011,24 @@ async function main() {
         }
 
         // Alterar para áudio
-        if (normalized === 'a' || normalized === '-a') {
+        if (normalized === '-a' || normalized === '--audio') {
             hasVideoFlag = false;
             console.log(`${colors.green}🎵 Modo Áudio ativado.${colors.reset}`);
             continue;
         }
 
         // Alterar para vídeo
-        if (normalized === 'v' || normalized === '-v') {
+        if (normalized === '-v' || normalized === '--video') {
             hasVideoFlag = true;
             console.log(`${colors.magenta}🎬 Modo Vídeo ativado.${colors.reset}`);
             continue;
         }
 
         // Permite usar o parâmetro junto da pesquisa
-        if (normalized.startsWith('-v ') ||
-            normalized.startsWith('--video ')) {
+        if (
+            normalized.startsWith('-v ') ||
+            normalized.startsWith('--video ')
+        ) {
             hasVideoFlag = true;
             command = command.replace(/^(-v|--video)\s+/i, '');
         } else if (
