@@ -283,9 +283,9 @@ function parseVideos(output) {
 }
 
 // Pesquisa inicial no YouTube
-async function searchVideos(query) {
+async function searchVideos(query, limit = 30) {
     const output = await runYtDlpAsync([
-        `ytsearch30:${query}`,
+        `ytsearch${limit}:${query}`,
         '--print', '%(id)s',
         '--print', '%(title)s',
         '--print', '%(uploader)s',
@@ -807,6 +807,8 @@ function showHelp() {
       ${colors.magenta}-v consulta${colors.reset}   Pesquisar em modo vídeo
       ${colors.yellow}-h${colors.reset}             Exibir esta ajuda
       ${colors.red}-q${colors.reset}             Encerrar o MyPlayer
+      ${colors.yellow}-l=N${colors.reset}          Limitar resultados da pesquisa
+      ${colors.gray}             Padrão: 30 resultados; páginas de 10.${colors.reset}
 
       ${colors.bold}Durante a reprodução:${colors.reset}
       ${colors.green}n${colors.reset}  Próxima faixa
@@ -851,7 +853,47 @@ async function main() {
     let initialQuery = cleanArgs.join(' ').trim();
 
     async function executeSearch(query) {
-        try {
+      try {
+          const limitMatches = [
+              ...query.matchAll(/(?:^|\s)-l=([^\s]+)/gi)
+          ];
+
+          if (limitMatches.length > 1) {
+              console.log(
+                  `${colors.red}❌ Informe apenas um limite por pesquisa.${colors.reset}`
+              );
+              return;
+          }
+
+          let limit = 30;
+
+          if (limitMatches.length === 1) {
+              const value = limitMatches[0][1];
+
+              if (!/^\d+$/.test(value) ||
+                  !Number.isSafeInteger(Number(value)) ||
+                  Number(value) < 1) {
+
+                  console.log(
+                      `${colors.red}❌ Limite inválido. Use um número inteiro maior que zero.${colors.reset}`
+                  );
+                  return;
+              }
+
+              limit = Number(value);
+          }
+
+          const searchQuery = query
+              .replace(/(?:^|\s)-l=[^\s]+/gi, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+
+          if (!searchQuery) {
+              console.log(
+                  `${colors.red}❌ Informe o que deseja pesquisar.${colors.reset}`
+              );
+              return;
+          }
             console.log(
                 hasVideoFlag
                     ? `\n${colors.bold}${colors.magenta}🎬 MYPLAYER — MODO VÍDEO${colors.reset}`
@@ -859,12 +901,12 @@ async function main() {
             );
 
             console.log(
-                `${colors.blue}🔍 Pesquisando por "${query}"...${colors.reset}\n`
+                `${colors.blue}🔍 Pesquisando por "${searchQuery}"...${colors.reset}\n`
             );
 
             const videos = await withLoadingAnimation(
                 'Buscando resultados',
-                () => searchVideos(query)
+                () => searchVideos(searchQuery, limit)
             );
 
             if (videos.length === 0) {
