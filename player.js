@@ -88,8 +88,14 @@ function runYtDlpAsync(args) {
             stdout += data;
 
             if (stdout.length > 10 * 1024 * 1024) {
+                if (finished) return;
+
+                finished = true;
                 child.kill();
-                reject(new Error('A saída da pesquisa excedeu o limite permitido.'));
+
+                reject(
+                    new Error('A saída da pesquisa excedeu o limite permitido.')
+                );
             }
         });
 
@@ -122,31 +128,48 @@ function runYtDlpAsync(args) {
 
 // Animação de carregamento
 async function withLoadingAnimation(message, task) {
-    const frames = [
-        '[=                   ]',
-        '[==                  ]',
-        '[====                ]',
-        '[======              ]',
-        '[========            ]',
-        '[==========          ]',
-        '[============        ]',
-        '[==============      ]',
-        '[================    ]',
-        '[==================  ]',
-        '[====================]'
-    ];
+    const trackSize = 24;
+    const blockSize = 5;
+
+    const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
     let frame = 0;
+    let position = 0;
+    let direction = 1;
 
     const interval = setInterval(() => {
+        const track = Array(trackSize).fill('─');
+
+        for (let i = 0; i < blockSize; i++) {
+            const index = position + i;
+
+            if (index < trackSize) {
+                track[index] = '━';
+            }
+        }
+
+        const bar =
+            `${colors.gray}[` +
+            `${colors.cyan}${track.join('')}` +
+            `${colors.gray}]${colors.reset}`;
+
+        const spinner =
+            `${colors.cyan}${frames[frame]}${colors.reset}`;
+
         process.stdout.write(
-            `\r\x1b[2K⏳ ${message} ${frames[frame]}`
+            `\r\x1b[2K ${spinner} ${colors.bold}${message}${colors.reset} ${bar}`
         );
 
         frame = (frame + 1) % frames.length;
-    }, 100);
 
-    process.stdout.write(`\r\x1b[2K⏳ ${message} ${frames[0]}`);
+        position += direction;
+
+        if (position >= trackSize - blockSize) {
+            direction = -1;
+        } else if (position <= 0) {
+            direction = 1;
+        }
+    }, 80);
 
     try {
         return await task();
@@ -214,8 +237,8 @@ function selectVideo(videos, pageSize = 10) {
         process.stdin.setRawMode(true);
         process.stdin.resume();
 
-        // Salva a posição inicial do menu
-        process.stdout.write('\x1b[?25l\x1b[s');
+        // Entra na tela alternativa e esconde o cursor.
+        process.stdout.write('\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l');
 
         function render() {
             const start = currentPage * pageSize;
@@ -252,23 +275,27 @@ function selectVideo(videos, pageSize = 10) {
                 }
             }
 
-            process.stdout.write('\x1b[u\x1b[J');
+            // Limpa a tela e redesenha o menu na mesma posição.
+            process.stdout.write('\x1b[2J\x1b[H');
             process.stdout.write(lines.join('\n'));
         }
 
         function finish(result) {
             if (finished) return;
+
             finished = true;
 
             process.stdin.removeListener('keypress', onKeypress);
 
             process.stdin.setRawMode(previousRawMode);
-            process.stdout.write('\x1b[u\x1b[J\x1b[?25h\n');
+
+            // Sai da tela alternativa e restaura o terminal.
+            process.stdout.write('\x1b[?1049l\x1b[?25h\n');
 
             resolve(result);
         }
 
-        function onKeypress(_character, key) {
+        function onKeypress(character, key) {
             if (!key) return;
 
             if (key.ctrl && key.name === 'c') {
@@ -393,34 +420,97 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
 }
 
 // Busca vídeos relacionados filtrando duplicatas
-function getRelatedVideos(videoId, currentTitle) {
+
+// Busca recomendações contextuais diretamente do YouTube
+async function getRelatedVideos(videoId, currentTitle) {
     try {
-        const output = runYtDlp([
-            `https://www.youtube.com/watch?v=${videoId}`,
-            '--print', '%(id)s',
-            '--print', '%(title)s',
-            '--print', '%(uploader)s',
-            '--playlist-items', '2-8',
-            '--no-warnings'
-        ]);
-
-        const videos = parseVideos(output);
-
-        return videos.filter(video => {
-            if (playedVideos.has(video.id)) {
-                return false;
+        const response = await fetch(
+            'https://www.youtube.com/youtubei/v1/next?prettyPrint=false',
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Origin': 'https://www.youtube.com',
+                    'Referer': `https://www.youtube.com/watch?v=${videoId}`,
+                    'X-YouTube-Client-Name': '1',
+                    'X-YouTube-Client-Version': '2.20260114.08.00'
+                },
+                body: JSON.stringify({
+                    context: {
+                        client: {
+                            clientName: 'WEB',
+                            clientVersion: '2.20260114.08.00',
+                            hl: 'pt-BR',
+                            gl: 'BR'
+                        }
+                    },
+                    videoId,
+                    contentCheckOk: true,
+                    racyCheckOk: true
+                }),
+                signal: AbortSignal.timeout(15000)
             }
+        );
 
-            if (areTitlesSimilar(currentTitle, video.title)) {
-                return false;
-            }
+        if (!response.ok) {
+            throw new Error(`YouTube respondeu com HTTP ${response.status}`);
+        }
 
-            return true;
-        });
+        const data = await response.json();
+
+        const results =
+            data.playerOverlays
+                ?.playerOverlayRenderer
+                ?.endScreen
+                ?.watchNextEndScreenRenderer
+                ?.results || [];
+
+        const videos = results
+            .map(item => item.endScreenVideoRenderer)
+            .filter(Boolean)
+            .map(video => {
+                const title =
+                    video.title?.simpleText ||
+                    video.title?.runs?.map(run => run.text).join('') ||
+                    'Sem título';
+
+                const uploader =
+                    video.shortBylineText?.runs?.map(run => run.text).join('') ||
+                    video.longBylineText?.runs?.map(run => run.text).join('') ||
+                    video.ownerText?.runs?.map(run => run.text).join('') ||
+                    'Desconhecido';
+
+                return {
+                    id: video.videoId ||
+                        video.endpoint?.watchEndpoint?.videoId,
+                    title,
+                    uploader
+                };
+            })
+            .filter(video => {
+                if (!video.id || playedVideos.has(video.id)) {
+                    return false;
+                }
+
+                if (video.id === videoId) {
+                    return false;
+                }
+
+                if (areTitlesSimilar(currentTitle, video.title)) {
+                    return false;
+                }
+
+                return true;
+            });
+
+        // Remove possíveis IDs duplicados sem alterar a ordem do YouTube.
+        return [
+            ...new Map(videos.map(video => [video.id, video])).values()
+        ];
 
     } catch (error) {
         console.error(
-            '\n⚠️ Erro ao buscar recomendações:',
+            '\n⚠️ Erro ao buscar recomendações do YouTube:',
             error.message
         );
 
@@ -428,130 +518,210 @@ function getRelatedVideos(videoId, currentTitle) {
     }
 }
 
+function askCommand(mode) {
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        const modeLabel = mode ? 'VÍDEO' : 'ÁUDIO';
+
+        rl.question(
+            `\n${colors.bold}${colors.cyan}myplayer${colors.reset} ` +
+            `${colors.gray}[${modeLabel}]${colors.reset}> `,
+            (answer) => {
+                rl.close();
+                resolve(answer.trim());
+            }
+        );
+    });
+}
+
 // Função principal
 async function main() {
     const args = process.argv.slice(2);
 
-    const hasVideoFlag = args.includes('-v') || args.includes('--video');
+    let hasVideoFlag = args.includes('-v') ||
+                       args.includes('--video');
 
-    const cleanArgs = args.filter(
-        arg => arg !== '-v' && arg !== '--video'
+    let cleanArgs = args.filter(arg =>
+        !['-v', '--video', '-a', '--audio'].includes(arg)
     );
 
-    const query = cleanArgs.join(' ').trim();
+    let initialQuery = cleanArgs.join(' ').trim();
 
-    if (!query) {
-        console.log('⚠️ Uso correto:');
-        console.log('   myplayer "nome da musica"         (Modo Áudio)');
-        console.log('   myplayer -v "nome do video"       (Modo Vídeo / PiP)');
-        process.exitCode = 1;
-        return;
-    }
-
-    let currentVideo = null;
-
-    try {
-        // Identificação do modo
-        console.log(
-            hasVideoFlag
-                ? `\n${colors.bold}${colors.magenta}🎬 MYPLAYER — MODO VÍDEO${colors.reset}`
-                : `\n${colors.bold}${colors.green}🎵 MYPLAYER — MODO ÁUDIO${colors.reset}`
-        );
-
-        console.log(
-            `${colors.blue}🔍 Pesquisando por "${query}"...${colors.reset}\n`
-        );
-
-        const videos = await withLoadingAnimation(
-            'Buscando resultados',
-            () => searchVideos(query)
-        );
-
-        if (videos.length === 0) {
-            console.log('❌ Nenhum resultado encontrado.');
-            return;
-        }
-
-        console.log(
-            `${colors.bold}${colors.green}✓ ${videos.length} resultados encontrados.${colors.reset}\n`
-        );
-
-        const selectedVideo = await selectVideo(videos, 10);
-
-        if (!selectedVideo) {
-            console.log(`${colors.yellow}Operação cancelada.${colors.reset}`);
-            return;
-        }
-
-        currentVideo = selectedVideo;
-
-        // LOOP DE AUTOPLAY CONTÍNUO
-        while (currentVideo) {
-            if (playedVideos.has(currentVideo.id)) {
-                console.log('\n⚠️ Vídeo já reproduzido.');
-                break;
-            }
-
-            playedVideos.add(currentVideo.id);
-
-            const videoUrl =
-                `https://www.youtube.com/watch?v=${currentVideo.id}`;
-
-            const exitCode = await playMedia(
-                videoUrl,
-                currentVideo.title,
-                currentVideo.uploader,
+    async function executeSearch(query) {
+        try {
+            console.log(
                 hasVideoFlag
+                    ? `\n${colors.bold}${colors.magenta}🎬 MYPLAYER — MODO VÍDEO${colors.reset}`
+                    : `\n${colors.bold}${colors.green}🎵 MYPLAYER — MODO ÁUDIO${colors.reset}`
             );
 
-            if (exitCode !== 0) {
-                if (exitCode !== null) {
-                    console.log(
-                        `⚠️ MPV finalizado com código ${exitCode}.`
-                    );
+            console.log(
+                `${colors.blue}🔍 Pesquisando por "${query}"...${colors.reset}\n`
+            );
+
+            const videos = await withLoadingAnimation(
+                'Buscando resultados',
+                () => searchVideos(query)
+            );
+
+            if (videos.length === 0) {
+                console.log(`${colors.red}❌ Nenhum resultado encontrado.${colors.reset}`);
+                return;
+            }
+
+            console.log(
+                `${colors.bold}${colors.green}✓ ${videos.length} resultados encontrados.${colors.reset}\n`
+            );
+
+            const selectedVideo = await selectVideo(videos, 10);
+
+            if (!selectedVideo) {
+                console.log(
+                    `${colors.yellow}✓ Seleção cancelada.${colors.reset}`
+                );
+                return;
+            }
+
+            let currentVideo = selectedVideo;
+
+            // LOOP DE AUTOPLAY
+            while (currentVideo) {
+                if (playedVideos.has(currentVideo.id)) {
+                    console.log('\n⚠️ Vídeo já reproduzido.');
+                    break;
                 }
 
-                break;
-            }
+                playedVideos.add(currentVideo.id);
 
-            console.log(
-                '🔄 Buscando próximas sugestões reais (Autoplay)...'
-            );
+                const videoUrl =
+                    `https://www.youtube.com/watch?v=${currentVideo.id}`;
 
-            const related = getRelatedVideos(
-                currentVideo.id,
-                currentVideo.title
-            );
-
-            if (related.length === 0) {
-                console.log(
-                    '❌ Nenhuma sugestão nova encontrada para continuar o autoplay.'
+                const exitCode = await playMedia(
+                    videoUrl,
+                    currentVideo.title,
+                    currentVideo.uploader,
+                    hasVideoFlag
                 );
 
-                break;
+                if (exitCode !== 0) {
+                    if (exitCode !== null) {
+                        console.log(
+                            `⚠️ MPV finalizado com código ${exitCode}.`
+                        );
+                    }
+                    break;
+                }
+
+                console.log(
+                    '🔄 Buscando próximas sugestões reais (Autoplay)...'
+                );
+
+                const related = await withLoadingAnimation(
+                    'Buscando recomendações do YouTube',
+                    () => getRelatedVideos(
+                        currentVideo.id,
+                        currentVideo.title
+                    )
+                );
+
+                if (related.length === 0) {
+                    console.log(
+                        '❌ Nenhuma sugestão nova encontrada para continuar o autoplay.'
+                    );
+                    break;
+                }
+
+                console.log(
+                    '⏭️ Autoplay ativado: Tocando a próxima faixa recomendada...'
+                );
+
+                currentVideo = related[0];
             }
 
-            console.log(
-                '⏭️ Autoplay ativado: Tocando a próxima faixa recomendada...'
-            );
+        } catch (error) {
+            if (error.isTtyError) {
+                console.log('❌ O ambiente não suporta prompts interativos.');
+            } else {
+                console.error(
+                    `\n${colors.red}❌ Erro na execução:${colors.reset}`,
+                    error.message
+                );
+            }
+        }
+    }
 
-            currentVideo = related[0];
+    console.log(
+        `\n${colors.bold}${colors.cyan}╭────────────── MYPLAYER ──────────────╮${colors.reset}`
+    );
+    console.log(
+        `${colors.bold}${colors.cyan}│${colors.reset}  ${colors.green}[A]${colors.reset} Áudio    ${colors.magenta}[V]${colors.reset} Vídeo    ${colors.red}[X]${colors.reset} Sair  ${colors.bold}${colors.cyan}│${colors.reset}`
+    );
+    console.log(
+        `${colors.bold}${colors.cyan}╰─────────────────────────────────────╯${colors.reset}`
+    );
+
+    let firstRun = true;
+
+    while (true) {
+        let command;
+
+        if (firstRun && initialQuery) {
+            command = initialQuery;
+        } else {
+            command = await askCommand(hasVideoFlag);
         }
 
-        console.log(
-            '\n👋 Valeu por usar o MyPlayer! Até a próxima.'
-        );
+        firstRun = false;
 
-    } catch (error) {
-        if (error.isTtyError) {
+        if (!command) {
+            continue;
+        }
+
+        const normalized = command.toLowerCase();
+
+        // Encerrar
+        if (normalized === 'x') {
             console.log(
-                '❌ O ambiente não suporta prompts interativos.'
+                `\n${colors.green}👋 Até a próxima!${colors.reset}`
             );
-        } else {
-            console.error(
-                '\n❌ Erro na execução:',
-                error.message
-            );
+            break;
+        }
+
+        // Alterar para áudio
+        if (normalized === 'a' || normalized === '-a') {
+            hasVideoFlag = false;
+            console.log(`${colors.green}🎵 Modo Áudio ativado.${colors.reset}`);
+            continue;
+        }
+
+        // Alterar para vídeo
+        if (normalized === 'v' || normalized === '-v') {
+            hasVideoFlag = true;
+            console.log(`${colors.magenta}🎬 Modo Vídeo ativado.${colors.reset}`);
+            continue;
+        }
+
+        // Permite usar o parâmetro junto da pesquisa
+        if (normalized.startsWith('-v ') ||
+            normalized.startsWith('--video ')) {
+            hasVideoFlag = true;
+            command = command.replace(/^(-v|--video)\s+/i, '');
+        } else if (
+            normalized.startsWith('-a ') ||
+            normalized.startsWith('--audio ')
+        ) {
+            hasVideoFlag = false;
+            command = command.replace(/^(-a|--audio)\s+/i, '');
+        }
+
+        const query = command.trim();
+
+        if (query) {
+            await executeSearch(query);
         }
     }
 }
