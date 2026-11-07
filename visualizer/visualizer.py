@@ -4,6 +4,8 @@ import os
 import time
 import stat
 import subprocess
+import socket
+import threading
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QRect
 from PySide6.QtGui import QColor, QPainter, QFont
@@ -49,9 +51,81 @@ class CavaReader(QThread):
     def stop(self):
         self.running = False
 
+class TitleServer(threading.Thread):
+    def __init__(self, socket_path, on_title):
+        super().__init__(daemon=True)
+
+        self.socket_path = socket_path
+        self.on_title = on_title
+        self.running = True
+        self.server = None
+
+    def run(self):
+        try:
+            if os.path.exists(self.socket_path):
+                os.unlink(self.socket_path)
+
+            self.server = socket.socket(
+                socket.AF_UNIX,
+                socket.SOCK_STREAM
+            )
+
+            self.server.bind(self.socket_path)
+            self.server.listen(5)
+            self.server.settimeout(0.5)
+
+            while self.running:
+                try:
+                    connection, _ = self.server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                with connection:
+                    try:
+                        data = b""
+
+                        while b"\n" not in data:
+                            chunk = connection.recv(4096)
+
+                            if not chunk:
+                                break
+
+                            data += chunk
+
+                        title = data.split(b"\n", 1)[0].decode(
+                            "utf-8"
+                        ).strip()
+
+                        if title:
+                            self.on_title(title)
+
+                    except (OSError, UnicodeDecodeError):
+                        continue
+
+        except OSError as error:
+            print(f"Erro no servidor de títulos: {error}")
+
+        finally:
+            if self.server:
+                self.server.close()
+
+            if os.path.exists(self.socket_path):
+                os.unlink(self.socket_path)
+
+    def stop(self):
+        self.running = False
+
+        if self.server:
+            self.server.close()
+
+        self.join(timeout=2)
 
 class Visualizer(QWidget):
-    def __init__(self, title="MyPlayer"):
+    title_received = Signal(str)
+
+    def __init__(self, title="MyPlayer", socket_path=None):
         super().__init__()
 
         self.settings = QSettings("MyPlayer", "Visualizer")
@@ -75,6 +149,20 @@ class Visualizer(QWidget):
         self.targets = [0.0] * self.bar_count
 
         self.title = title
+
+        self.title_received.connect(self.update_title)
+
+        self.title_server = None
+
+        if socket_path:
+            self.title_server = TitleServer(
+                socket_path,
+                self.title_received.emit
+            )
+
+            self.title_server.start()
+
+
         self.marquee_offset = 0.0
 
         self.visualizer_modes = ["Barras XP"]
@@ -366,6 +454,10 @@ class Visualizer(QWidget):
 
     def closeEvent(self, event):
         self.save_position()
+
+        if self.title_server:
+            self.title_server.stop()
+
         self.timer.stop()
 
         self.reader.stop()
@@ -381,13 +473,19 @@ class Visualizer(QWidget):
 
         event.accept()
 
+    def update_title(self, title):
+        self.title = title
+        self.marquee_offset = 0.0
+        self.update()
+
 
 if __name__ == "__main__":
-    title = " ".join(sys.argv[1:]) or "MyPlayer"
+    title = sys.argv[1] if len(sys.argv) > 1 else "MyPlayer"
+    socket_path = sys.argv[2] if len(sys.argv) > 2 else None
 
     app = QApplication(sys.argv)
 
-    window = Visualizer(title)
+    window = Visualizer(title, socket_path)
     window.show()
 
     sys.exit(app.exec())

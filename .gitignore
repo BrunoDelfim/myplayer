@@ -2,6 +2,9 @@
 # Dependências do Node.js
 node_modules/
 
+# Dependências do Python
+visualizer/__pycache__/
+
 # Variáveis de ambiente
 .env
 .env.*
@@ -17,3 +20,7 @@ pnpm-debug.log*
 # Arquivos do sistema
 .DS_Store
 Thumbs.db
+
+# Backups
+visualizer.py.bak
+player.js.bak

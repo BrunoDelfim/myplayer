@@ -5,6 +5,194 @@ const readline = require('readline');
 const net = require('net');
 const fs = require('fs');
 
+// Gerenciamento independente do visualizador.
+let visualizerProcess = null;
+const visualizerSocketPath = `/tmp/myplayer-visualizer-${process.pid}.sock`;
+// Gerenciamento do roteamento de áudio
+let audioSinkModuleId = null;
+let audioLoopbackModuleId = null;
+
+function startAudioRouting() {
+    if (audioSinkModuleId && audioLoopbackModuleId) {
+        return;
+    }
+
+    try {
+        const defaultSink = execFileSync(
+            'pactl',
+            ['get-default-sink'],
+            { encoding: 'utf8' }
+        ).trim();
+
+        if (!defaultSink) {
+            throw new Error('Não foi possível identificar a saída de áudio padrão.');
+        }
+
+        // Cria o dispositivo virtual
+        audioSinkModuleId = execFileSync(
+            'pactl',
+            [
+                'load-module',
+                'module-null-sink',
+                'sink_name=myplayer_sink',
+                'sink_properties=device.description=MyPlayer'
+            ],
+            { encoding: 'utf8' }
+        ).trim();
+
+        // Encaminha o áudio para a saída física
+        audioLoopbackModuleId = execFileSync(
+            'pactl',
+            [
+                'load-module',
+                'module-loopback',
+                'source=myplayer_sink.monitor',
+                `sink=${defaultSink}`,
+                'latency_msec=20'
+            ],
+            { encoding: 'utf8' }
+        ).trim();
+
+        console.log('🔊 Roteamento de áudio ativado.');
+
+    } catch (error) {
+        stopAudioRouting();
+        throw new Error(`Falha ao configurar o áudio: ${error.message}`);
+    }
+}
+
+function stopAudioRouting() {
+    // Remove primeiro o loopback
+    if (audioLoopbackModuleId) {
+        try {
+            execFileSync('pactl', [
+                'unload-module',
+                audioLoopbackModuleId
+            ]);
+        } catch {}
+
+        audioLoopbackModuleId = null;
+    }
+
+    // Depois remove o dispositivo virtual
+    if (audioSinkModuleId) {
+        try {
+            execFileSync('pactl', [
+                'unload-module',
+                audioSinkModuleId
+            ]);
+        } catch {}
+
+        audioSinkModuleId = null;
+    }
+}
+
+// Encerramento seguro do MyPlayer
+let isShuttingDown = false;
+
+function handleShutdown(signal) {
+    if (isShuttingDown) return;
+
+    isShuttingDown = true;
+
+    console.log('\n🛑 Encerrando MyPlayer...');
+
+    // Fecha o visualizador
+    stopVisualizer();
+
+    // Remove o roteamento de áudio
+    stopAudioRouting();
+
+    // Restaura o terminal, caso esteja em modo raw
+    if (process.stdin.isTTY &&
+        typeof process.stdin.setRawMode === 'function') {
+        process.stdin.setRawMode(false);
+    }
+
+    const exitCodes = {
+        SIGINT: 130,
+        SIGTERM: 143,
+        SIGHUP: 129
+    };
+
+    process.exit(exitCodes[signal] || 1);
+}
+
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGHUP', () => handleShutdown('SIGHUP'));
+
+function sendVisualizerTitle(title, attempt = 0) {
+    if (!visualizerProcess) return;
+
+    const client = net.createConnection(visualizerSocketPath);
+
+    client.once('connect', () => {
+        client.write(`${title}\n`);
+        client.end();
+    });
+
+    client.once('error', () => {
+        client.destroy();
+
+        if (attempt < 20 && visualizerProcess) {
+            setTimeout(() => {
+                sendVisualizerTitle(title, attempt + 1);
+            }, 100);
+        }
+    });
+}
+
+function startVisualizer(title) {
+    if (
+        visualizerProcess &&
+        visualizerProcess.exitCode === null &&
+        visualizerProcess.signalCode === null
+    ) {
+        sendVisualizerTitle(title);
+        return;
+    }
+
+    const child = spawn(
+        'python3',
+        [
+            `${__dirname}/visualizer/visualizer.py`,
+            title,
+            visualizerSocketPath
+        ],
+        { stdio: 'ignore' }
+    );
+
+    visualizerProcess = child;
+
+    child.once('error', (error) => {
+        console.error('Erro ao iniciar o visualizador:', error.message);
+
+        if (visualizerProcess === child) {
+            visualizerProcess = null;
+        }
+    });
+
+    child.once('close', () => {
+        if (visualizerProcess === child) {
+            visualizerProcess = null;
+        }
+    });
+}
+
+function stopVisualizer() {
+    const child = visualizerProcess;
+    visualizerProcess = null;
+
+    if (
+        child &&
+        child.exitCode === null &&
+        child.signalCode === null
+    ) {
+        child.kill('SIGTERM');
+    }
+}
+
 // Cores ANSI
 const colors = {
     reset: '\x1b[0m',
@@ -445,6 +633,12 @@ function selectVideo(videos, pageSize = 10) {
 // Função auxiliar para rodar o mpv
 function playMedia(videoUrl, title, uploader, hasVideoFlag) {
     return new Promise((resolve) => {
+        if (!hasVideoFlag) {
+            startAudioRouting();
+        }
+
+        sendVisualizerTitle(title);
+
         console.log(`\n▶️ Reproduzindo: ${title} (${uploader})`);
 
         const socketPath = `/tmp/myplayer-mpv-${process.pid}.sock`;
@@ -458,8 +652,12 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             '--hwdec=vaapi',
             '--gpu-api=opengl',
             `--input-ipc-server=${socketPath}`,
-            '--input-terminal=no'
+            '--input-terminal=no',
         ];
+
+        if (!hasVideoFlag) {
+            mpvArgs.push('--audio-device=pipewire/myplayer_sink');
+        }
 
         if (hasVideoFlag) {
             mpvArgs.push(
@@ -525,7 +723,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             process.stdin.resume();
 
             console.log(
-                `${colors.cyan}⌨️ Controles: n próximo | p pausar | r retomar | +/- volume | q voltar ao prompt${colors.reset}`
+                `${colors.cyan}⌨️ Controles: n próximo | p pausar | r retomar | +/- volume | v visualizador | q voltar ao prompt${colors.reset}`
             );
 
             inputHandler = (str, key) => {
@@ -568,6 +766,11 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
                     case '-':
                         sendCommand(['add', 'volume', -5]);
                         showVolume();
+                        break;
+
+                    case 'v':
+                        startVisualizer(title);
+                        console.log('\n📊 Visualizador aberto.');
                         break;
 
                     case 'q':
@@ -816,6 +1019,7 @@ function showHelp() {
       ${colors.green}r${colors.reset}  Retomar
       ${colors.green}+${colors.reset}  Aumentar volume
       ${colors.green}-${colors.reset}  Diminuir volume
+      ${colors.green}v${colors.reset}  Abrir visualizador
       ${colors.green}q${colors.reset}  Voltar ao prompt
 
       ${colors.gray}No prompt, letras sem prefixo são termos de pesquisa.${colors.reset}
@@ -1004,6 +1208,9 @@ async function main() {
                     error.message
                 );
             }
+        } finally {
+            stopVisualizer();
+            stopAudioRouting();
         }
     }
 
