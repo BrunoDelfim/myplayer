@@ -97,7 +97,6 @@ function handleShutdown(signal) {
 
     console.log('\n🛑 Encerrando MyPlayer...');
 
-    // Fecha o visualizador
     stopVisualizer();
 
     // Remove o roteamento de áudio
@@ -128,9 +127,7 @@ function sendVisualizerTitle(title, attempt = 0) {
     const client = net.createConnection(visualizerSocketPath);
 
     client.once('connect', () => {
-        console.log(
-            `[DEBUG] IPC conectado: ${Date.now() - startupStart} ms`
-        );
+        console.log('[DEBUG] IPC conectado.');
         client.write(`${title}\n`);
         client.end();
     });
@@ -263,6 +260,7 @@ const colors = {
 
 // Histórico de vídeos reproduzidos nesta execução
 const playedVideos = new Set();
+const playedTitles = [];
 
 // Detecta se o título do vídeo indica que é um álbum completo
 // Converte duração em segundos, aceitando números e formatos HH:MM:SS.
@@ -361,10 +359,31 @@ function areTitlesSimilar(titleA, titleB) {
     if (!a || !b) return false;
     if (a === b) return true;
 
-    const shorter = a.length <= b.length ? a : b;
-    const longer = a.length > b.length ? a : b;
+    const ignoredWords = new Set([
+        'official', 'video', 'audio', 'lyrics', 'lyric',
+        'remastered', 'live', 'ao', 'vivo',
+        'repertorio', 'atualizado', 'hitou', 'brasil'
+    ]);
 
-    return shorter.length >= 12 && longer.includes(shorter);
+    const getTokens = (title) => new Set(
+        title.split(/\s+/).filter(word =>
+            word.length > 2 &&
+            !ignoredWords.has(word) &&
+            !/^\d+$/.test(word)
+        )
+    );
+
+    const tokensA = getTokens(a);
+    const tokensB = getTokens(b);
+
+    const common = [...tokensA].filter(word => tokensB.has(word));
+
+    if (common.length < 3) return false;
+
+    const similarity = common.length /
+        Math.min(tokensA.size, tokensB.size);
+
+    return similarity >= 0.6;
 }
 
 // Executa yt-dlp de forma síncrona
@@ -731,11 +750,11 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             mpvArgs.push('--ytdl-format=bestaudio');
         }
 
-        mpvArgs.push(
-                hasVideoFlag
-                    ? '--ytdl-raw-options='
-                    : '--ytdl-raw-options=extractor-args=youtube:player_client=visionos,tv_samsung'
+       if (!hasVideoFlag) {
+            mpvArgs.push(
+                '--ytdl-raw-options-append=extractor-args=youtube:player_client=visionos,tv_samsung'
             );
+        }
         mpvArgs.push(videoUrl);
 
         console.log(
@@ -1058,7 +1077,9 @@ async function getRelatedVideos(videoId, currentTitle, isAudioMode) {
                     return false;
                 }
 
-                if (areTitlesSimilar(currentTitle, video.title)) {
+                if (playedTitles.some(title =>
+                    areTitlesSimilar(title, video.title)
+                )) {
                     return false;
                 }
 
@@ -1233,6 +1254,7 @@ async function main() {
                   }
 
                   playedVideos.add(currentVideo.id);
+                  playedTitles.push(currentVideo.title);
                   isFirstPlayback = false;
 
                 const videoUrl =
@@ -1304,13 +1326,17 @@ async function main() {
                 );
             }
         } finally {
+            // Encerra o histórico da sessão de reprodução atual.
+            playedVideos.clear();
+            playedTitles.length = 0;
+
             stopVisualizer();
             stopAudioRouting();
         }
     }
 
     console.log(
-        `\n${colors.bold}${colors.cyan}╭────────────── MYPLAYER ──────────────╮${colors.reset}`
+        `\n${colors.bold}${colors.cyan}╭─────────────── MYPLAYER ────────────────╮${colors.reset}`
     );
 
     console.log(
@@ -1318,7 +1344,7 @@ async function main() {
     );
 
     console.log(
-        `${colors.bold}${colors.cyan}╰─────────────────────────────────────╯${colors.reset}`
+        `${colors.bold}${colors.cyan}╰─────────────────────────────────────────╯${colors.reset}`
     );
 
     let firstRun = true;
