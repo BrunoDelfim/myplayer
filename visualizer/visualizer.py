@@ -6,6 +6,7 @@ import stat
 import subprocess
 import socket
 import threading
+import signal
 
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSettings, QRect
 from PySide6.QtGui import QColor, QPainter, QFont
@@ -479,6 +480,7 @@ class Visualizer(QWidget):
         self.update()
 
 
+
 if __name__ == "__main__":
     title = sys.argv[1] if len(sys.argv) > 1 else "MyPlayer"
     socket_path = sys.argv[2] if len(sys.argv) > 2 else None
@@ -487,5 +489,7 @@ if __name__ == "__main__":
 
     window = Visualizer(title, socket_path)
     window.show()
+
+    signal.signal(signal.SIGUSR1, lambda *_: window.close())
 
     sys.exit(app.exec())

@@ -128,6 +128,9 @@ function sendVisualizerTitle(title, attempt = 0) {
     const client = net.createConnection(visualizerSocketPath);
 
     client.once('connect', () => {
+        console.log(
+            `[DEBUG] IPC conectado: ${Date.now() - startupStart} ms`
+        );
         client.write(`${title}\n`);
         client.end();
     });
@@ -153,6 +156,35 @@ function startVisualizer(title) {
         return;
     }
 
+    try {
+          fs.writeFileSync(
+              '/tmp/myplayer-cava-raw.conf',
+              `[general]
+              framerate = 60
+              bars = 32
+              sensitivity = 350
+              autosens = 0
+              sleep_timer = 0
+
+              [input]
+              method = pulse
+              source = myplayer_sink.monitor
+
+              [output]
+              method = raw
+              raw_target = /tmp/myplayer-cava.raw
+              data_format = ascii
+              channels = mono
+              `
+          );
+      } catch (error) {
+          console.error(
+              'Erro ao criar configuração do CAVA:',
+              error.message
+          );
+          return;
+      }
+
     const child = spawn(
         'python3',
         [
@@ -160,7 +192,7 @@ function startVisualizer(title) {
             title,
             visualizerSocketPath
         ],
-        { stdio: 'ignore' }
+        { stdio: 'inherit' }
     );
 
     visualizerProcess = child;
@@ -180,18 +212,37 @@ function startVisualizer(title) {
     });
 }
 
+
 function stopVisualizer() {
     const child = visualizerProcess;
     visualizerProcess = null;
 
     if (
-        child &&
-        child.exitCode === null &&
-        child.signalCode === null
+        !child ||
+        child.exitCode !== null ||
+        child.signalCode !== null
     ) {
-        child.kill('SIGTERM');
+        return;
     }
+
+    // Solicita ao Python que feche o Qt normalmente.
+    child.kill('SIGUSR1');
+
+    // Aguarda até 2 segundos antes de forçar o encerramento.
+    const forceKill = setTimeout(() => {
+        if (
+            child.exitCode === null &&
+            child.signalCode === null
+        ) {
+            child.kill('SIGTERM');
+        }
+    }, 2000);
+
+    child.once('close', () => {
+        clearTimeout(forceKill);
+    });
 }
+
 
 // Cores ANSI
 const colors = {
@@ -474,6 +525,7 @@ function parseVideos(output) {
 async function searchVideos(query, limit = 30) {
     const output = await runYtDlpAsync([
         `ytsearch${limit}:${query}`,
+        '--flat-playlist',
         '--print', '%(id)s',
         '--print', '%(title)s',
         '--print', '%(uploader)s',
@@ -633,9 +685,15 @@ function selectVideo(videos, pageSize = 10) {
 // Função auxiliar para rodar o mpv
 function playMedia(videoUrl, title, uploader, hasVideoFlag) {
     return new Promise((resolve) => {
+        const startupStart = Date.now();
+
         if (!hasVideoFlag) {
             startAudioRouting();
         }
+
+        console.log(
+            `[DEBUG] Preparação do áudio: ${Date.now() - startupStart} ms`
+        );
 
         sendVisualizerTitle(title);
 
@@ -653,6 +711,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             '--gpu-api=opengl',
             `--input-ipc-server=${socketPath}`,
             '--input-terminal=no',
+            '--term-playing-msg=[DEBUG] MPV iniciou playback'
         ];
 
         if (!hasVideoFlag) {
@@ -672,8 +731,16 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             mpvArgs.push('--ytdl-format=bestaudio');
         }
 
-        mpvArgs.push('--ytdl-raw-options=');
+        mpvArgs.push(
+                hasVideoFlag
+                    ? '--ytdl-raw-options='
+                    : '--ytdl-raw-options=extractor-args=youtube:player_client=visionos,tv_samsung'
+            );
         mpvArgs.push(videoUrl);
+
+        console.log(
+            `[DEBUG] Tempo até iniciar MPV: ${Date.now() - startupStart} ms`
+        );
 
         const mpv = spawn('mpv', mpvArgs, {
             stdio: ['ignore', 'inherit', 'inherit'],
@@ -690,6 +757,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
         let paused = false;
         let ipcBuffer = '';
         let requestId = 0;
+        let playbackStarted = false;
 
         const previousRawMode = Boolean(process.stdin.isRaw);
 
@@ -817,6 +885,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
 
                 ipc = client;
                 ipc.on('error', () => {});
+
                 ipc.on('data', (chunk) => {
                     ipcBuffer += chunk.toString();
 
@@ -828,6 +897,20 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
 
                         try {
                             const response = JSON.parse(line);
+
+                            // Detecta o primeiro avanço da reprodução.
+                            if (
+                                !playbackStarted &&
+                                response.event === 'property-change' &&
+                                response.name === 'time-pos' &&
+                                typeof response.data === 'number'
+                            ) {
+                                playbackStarted = true;
+
+                                console.log(
+                                    `[DEBUG] Tempo até iniciar a reprodução: ${Date.now() - startupStart} ms`
+                                );
+                            }
 
                             if (
                                 response.request_id &&
@@ -843,6 +926,14 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
                         }
                     }
                 });
+
+                // Observa o avanço da posição da mídia.
+                const observationId = ++requestId;
+
+                sendCommand(
+                    ['observe_property', observationId, 'time-pos'],
+                    observationId
+                );
 
                 activateControls();
             });
@@ -1132,18 +1223,22 @@ async function main() {
             }
 
             let currentVideo = selectedVideo;
+            let isFirstPlayback = true;
 
             // LOOP DE AUTOPLAY
             while (currentVideo) {
-                if (playedVideos.has(currentVideo.id)) {
-                    console.log('\n⚠️ Vídeo já reproduzido.');
-                    break;
-                }
+               if (!isFirstPlayback && playedVideos.has(currentVideo.id)) {
+                      console.log('\n⚠ Vídeo já reproduzido.');
+                      break;
+                  }
 
-                playedVideos.add(currentVideo.id);
+                  playedVideos.add(currentVideo.id);
+                  isFirstPlayback = false;
 
                 const videoUrl =
                     `https://www.youtube.com/watch?v=${currentVideo.id}`;
+                    
+                console.log(`[DEBUG] Video ID: ${currentVideo.id}`);
 
                 const playback = await playMedia(
                     videoUrl,
