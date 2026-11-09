@@ -775,6 +775,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
         let inputHandler = null;
         let paused = false;
         let ipcBuffer = '';
+        let playbackPosition = 0;
         let requestId = 0;
         let playbackStarted = false;
 
@@ -797,6 +798,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             sendCommand(['get_property', 'volume'], id);
         }
 
+        
         function activateControls() {
             if (!process.stdin.isTTY || !process.stdin.setRawMode) {
                 console.log(
@@ -810,13 +812,25 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
             process.stdin.resume();
 
             console.log(
-                `${colors.cyan}⌨️ Controles: n próximo | p pausar | r retomar | +/- volume | v visualizador | q voltar ao prompt${colors.reset}`
+                `${colors.cyan}⌨️ Controles: p pausar/retomar | n próxima | b voltar | ← 10s atrás | → 10s à frente | +/- volume | v visualizador | q voltar ao prompt${colors.reset}`
             );
 
             inputHandler = (str, key) => {
                 if (key?.ctrl && key.name === 'c') {
                     requestedAction = 'quit';
                     sendCommand(['quit']);
+                    return;
+                }
+
+                // Retroceder 10 segundos.
+                if (key.name === 'left') {
+                    sendCommand(['seek', -10, 'relative']);
+                    return;
+                }
+
+                // Avançar 10 segundos.
+                if (key.name === 'right') {
+                    sendCommand(['seek', 10, 'relative']);
                     return;
                 }
 
@@ -830,19 +844,35 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
                         break;
 
                     case 'p':
-                        if (paused) return;
+                        paused = !paused;
 
-                        paused = true;
-                        sendCommand(['set_property', 'pause', true]);
-                        console.log('\n⏸️ Reprodução pausada.');
+                        sendCommand([
+                            'set_property',
+                            'pause',
+                            paused
+                        ]);
+
+                        console.log(
+                            paused
+                                ? '\n⏸️ Reprodução pausada.'
+                                : '\n▶️ Reprodução retomada.'
+                        );
                         break;
 
-                    case 'r':
-                        if (!paused) return;
+                    case 'b':
+                        if (requestedAction) return;
 
-                        paused = false;
-                        sendCommand(['set_property', 'pause', false]);
-                        console.log('\n▶️ Reprodução retomada.');
+                        if (playbackPosition > 3) {
+                            sendCommand(['seek', 0, 'absolute']);
+                            playbackPosition = 0;
+
+                            console.log('\n⏮️ Música reiniciada.');
+                        } else {
+                            requestedAction = 'previous';
+
+                            console.log('\n⏮️ Voltando à música anterior...');
+                            sendCommand(['quit']);
+                        }
                         break;
 
                     case '+':
@@ -864,9 +894,11 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
                         if (requestedAction) return;
 
                         requestedAction = 'quit';
+
                         console.log(
                             '\n⏹️ Encerrando reprodução e retornando ao prompt...'
                         );
+
                         sendCommand(['quit']);
                         break;
                 }
@@ -874,6 +906,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
 
             process.stdin.on('keypress', inputHandler);
         }
+
 
         function connectIpc(attempt = 0) {
             if (finished) return;
@@ -918,17 +951,21 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
                             const response = JSON.parse(line);
 
                             // Detecta o primeiro avanço da reprodução.
+                           // Acompanha a posição atual da reprodução.
                             if (
-                                !playbackStarted &&
                                 response.event === 'property-change' &&
                                 response.name === 'time-pos' &&
                                 typeof response.data === 'number'
                             ) {
-                                playbackStarted = true;
+                                playbackPosition = response.data;
 
-                                console.log(
-                                    `[DEBUG] Tempo até iniciar a reprodução: ${Date.now() - startupStart} ms`
-                                );
+                                if (!playbackStarted) {
+                                    playbackStarted = true;
+
+                                    console.log(
+                                        `[DEBUG] Tempo até iniciar a reprodução: ${Date.now() - startupStart} ms`
+                                    );
+                                }
                             }
 
                             if (
@@ -1125,10 +1162,12 @@ function showHelp() {
       ${colors.yellow}-l=N${colors.reset}          Limitar resultados da pesquisa
       ${colors.gray}             Padrão: 30 resultados; páginas de 10.${colors.reset}
 
-      ${colors.bold}Durante a reprodução:${colors.reset}
+      ${colors.bold}${colors.cyan}Durante a reprodução:${colors.reset}
+      ${colors.green}p${colors.reset}  Pausar / continuar
       ${colors.green}n${colors.reset}  Próxima faixa
-      ${colors.green}p${colors.reset}  Pausar
-      ${colors.green}r${colors.reset}  Retomar
+      ${colors.green}b${colors.reset}  Reiniciar faixa / voltar à anterior
+      ${colors.green}←${colors.reset}  Retroceder 10 segundos
+      ${colors.green}→${colors.reset}  Avançar 10 segundos
       ${colors.green}+${colors.reset}  Aumentar volume
       ${colors.green}-${colors.reset}  Diminuir volume
       ${colors.green}v${colors.reset}  Abrir visualizador
@@ -1246,16 +1285,28 @@ async function main() {
             let currentVideo = selectedVideo;
             let isFirstPlayback = true;
 
+            const playbackHistory = [selectedVideo];
+            let historyIndex = 0;
+            let replayingHistory = false;
+
             // LOOP DE AUTOPLAY
             while (currentVideo) {
-               if (!isFirstPlayback && playedVideos.has(currentVideo.id)) {
-                      console.log('\n⚠ Vídeo já reproduzido.');
-                      break;
-                  }
+              if (
+                    !isFirstPlayback &&
+                    !replayingHistory &&
+                    playedVideos.has(currentVideo.id)
+                ) {
+                    console.log('\n⚠ Vídeo já reproduzido.');
+                    break;
+                }
 
-                  playedVideos.add(currentVideo.id);
-                  playedTitles.push(currentVideo.title);
-                  isFirstPlayback = false;
+                if (!playedVideos.has(currentVideo.id)) {
+                    playedVideos.add(currentVideo.id);
+                    playedTitles.push(currentVideo.title);
+                }
+
+                isFirstPlayback = false;
+                replayingHistory = false;
 
                 const videoUrl =
                     `https://www.youtube.com/watch?v=${currentVideo.id}`;
@@ -1273,6 +1324,18 @@ async function main() {
                 if (playback.action === 'quit') {
                     console.log('✓ Retornando ao MyPlayer.');
                     break;
+                }
+
+                // Volta para a música anterior.
+                if (playback.action === 'previous') {
+                    if (historyIndex > 0) {
+                        historyIndex--;
+                    }
+
+                    currentVideo = playbackHistory[historyIndex];
+                    replayingHistory = true;
+
+                    continue;
                 }
 
                 // Interrompe em caso de erro no MPV.
@@ -1314,6 +1377,13 @@ async function main() {
                 );
 
                 currentVideo = related[0];
+
+                // Se o usuário voltou no histórico e avançou novamente,
+                // descarta o trecho posterior da navegação.
+                playbackHistory.splice(historyIndex + 1);
+
+                playbackHistory.push(currentVideo);
+                historyIndex = playbackHistory.length - 1;
             }
 
         } catch (error) {
