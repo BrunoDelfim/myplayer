@@ -352,6 +352,7 @@ function normalizeTitle(title) {
 }
 
 // Verifica títulos iguais ou versões muito semelhantes
+
 function areTitlesSimilar(titleA, titleB) {
     const a = normalizeTitle(titleA);
     const b = normalizeTitle(titleB);
@@ -361,8 +362,15 @@ function areTitlesSimilar(titleA, titleB) {
 
     const ignoredWords = new Set([
         'official', 'video', 'audio', 'lyrics', 'lyric',
-        'remastered', 'live', 'ao', 'vivo',
-        'repertorio', 'atualizado', 'hitou', 'brasil'
+        'remastered', 'live', 'ao', 'vivo', 'repertorio',
+        'atualizado', 'hitou', 'brasil',
+
+        // Palavras comuns que, isoladamente, não identificam uma música.
+        'amor', 'vida', 'saudade', 'coracao', 'noite', 'dia',
+        'baby', 'love', 'meu', 'minha', 'teu', 'tua', 'voce',
+        'comigo', 'hoje', 'pra', 'para', 'mais', 'muito',
+        'tudo', 'nada', 'sonho', 'tempo', 'vez', 'desejo',
+        'paixao'
     ]);
 
     const getTokens = (title) => new Set(
@@ -376,34 +384,38 @@ function areTitlesSimilar(titleA, titleB) {
     const tokensA = getTokens(a);
     const tokensB = getTokens(b);
 
-    const common = [...tokensA].filter(word => tokensB.has(word));
+    if (!tokensA.size || !tokensB.size) return false;
 
-    if (common.length < 3) return false;
+    const smaller = tokensA.size <= tokensB.size
+        ? tokensA
+        : tokensB;
 
-    const similarity = common.length /
-        Math.min(tokensA.size, tokensB.size);
+    const larger = tokensA.size > tokensB.size
+        ? tokensA
+        : tokensB;
+
+    const common = [...smaller].filter(word =>
+        larger.has(word)
+    );
+
+    // Títulos de uma única palavra precisam ter pelo menos
+    // cinco caracteres e corresponder exatamente.
+    if (smaller.size === 1) {
+        const [word] = smaller;
+        return word.length >= 5 && common.length === 1;
+    }
+
+    if (common.length < 2) return false;
+
+    // Duas palavras só são suficientes quando ambas
+    // correspondem exatamente ao título menor.
+    if (common.length === 2) {
+        return smaller.size === 2;
+    }
+
+    const similarity = common.length / smaller.size;
 
     return similarity >= 0.6;
-}
-
-// Executa yt-dlp de forma síncrona
-// Mantido para a busca de recomendações do autoplay
-function runYtDlp(args) {
-    try {
-        return execFileSync('yt-dlp', args, {
-            encoding: 'utf8',
-            maxBuffer: 10 * 1024 * 1024
-        });
-    } catch (error) {
-        if (error.stderr) {
-            const stderr = error.stderr.toString().trim();
-            if (stderr) {
-                throw new Error(stderr);
-            }
-        }
-
-        throw error;
-    }
 }
 
 // Executa yt-dlp de forma assíncrona
@@ -762,7 +774,7 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
         );
 
         const mpv = spawn('mpv', mpvArgs, {
-            stdio: ['ignore', 'inherit', 'inherit'],
+            stdio: ['ignore', 'inherit', 'ignore'],
             env: {
                 ...process.env,
                 LIBVA_DRIVER_NAME: 'i965'
@@ -1072,6 +1084,42 @@ async function getRelatedVideos(videoId, currentTitle, isAudioMode) {
         }
 
         const data = await response.json();
+
+        function inspectStructure(value, path = 'data', depth = 0) {
+            if (!value || typeof value !== 'object' || depth > 12) {
+                return;
+            }
+
+            for (const [key, child] of Object.entries(value)) {
+                const currentPath = `${path}.${key}`;
+
+                if (
+                    key === 'playlistPanelRenderer' ||
+                    key === 'musicPlaylistShelfRenderer' ||
+                    key === 'playlist' ||
+                    key === 'continuations'
+                ) {
+                    console.log(`\n[PLAYLIST DEBUG] ${currentPath}`);
+
+                    if (Array.isArray(child)) {
+                        console.log(`Array com ${child.length} elementos`);
+                        console.log(
+                            JSON.stringify(child[0] || {}, null, 2).slice(0, 2500)
+                        );
+                    } else {
+                        console.log(
+                            JSON.stringify(child, null, 2).slice(0, 3500)
+                        );
+                    }
+                }
+
+                if (child && typeof child === 'object') {
+                    inspectStructure(child, currentPath, depth + 1);
+                }
+            }
+        }
+
+        inspectStructure(data);
 
         const results =
             data.playerOverlays
