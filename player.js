@@ -774,11 +774,109 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
         );
 
         const mpv = spawn('mpv', mpvArgs, {
-            stdio: ['ignore', 'inherit', 'ignore'],
+            stdio: ['ignore', 'pipe', 'pipe'],
             env: {
                 ...process.env,
                 LIBVA_DRIVER_NAME: 'i965'
             }
+        });
+
+        let mpvOutputLog = '';
+        let mpvErrorLog = '';
+        let readingFileTags = false;
+
+        mpv.stdout.setEncoding('utf8');
+        mpv.stderr.setEncoding('utf8');
+
+        function saveMpvLog(type, data) {
+            if (type === 'stdout') {
+                mpvOutputLog = (mpvOutputLog + data).slice(-30000);
+            } else {
+                mpvErrorLog = (mpvErrorLog + data).slice(-30000);
+            }
+        }
+
+        function displayMpvLine(line, separator) {
+            const value = line.trim();
+
+            if (!value) {
+                if (readingFileTags) {
+                    readingFileTags = false;
+                }
+                return;
+            }
+
+            if (value === 'File tags:') {
+                readingFileTags = true;
+                process.stdout.write('\nFile tags:\n');
+                return;
+            }
+
+            if (readingFileTags && /^(Date|Uploader|Channel_URL):/.test(value)) {
+                process.stdout.write(` ${value}\n`);
+                return;
+            }
+
+            readingFileTags = false;
+
+            // Informações dos fluxos de áudio, vídeo e legendas.
+            if (/^[●○]\s*(Audio|Video|Subs)\b/.test(value)) {
+                process.stdout.write(`${value}\n`);
+                return;
+            }
+
+            // Informações dos dispositivos de saída.
+            if (/^(AO|VO):/.test(value)) {
+                process.stdout.write(`${value}\n`);
+                return;
+            }
+
+            // Mensagem de inicialização configurada pelo próprio MyPlayer.
+            if (value === '[DEBUG] MPV iniciou playback') {
+                console.log(value);
+                return;
+            }
+
+            // Progresso da reprodução: mantém a atualização na mesma linha.
+            if (/^(A|V|AV):\s/.test(value)) {
+                process.stdout.write(`\r${value}`);
+            }
+        }
+
+        let mpvOutputBuffer = '';
+
+        mpv.stdout.on('data', (chunk) => {
+            saveMpvLog('stdout', chunk);
+            mpvOutputBuffer += chunk;
+
+            let separatorIndex;
+
+            while ((separatorIndex = mpvOutputBuffer.search(/[\r\n]/)) !== -1) {
+                const line = mpvOutputBuffer.slice(0, separatorIndex);
+                const separator = mpvOutputBuffer[separatorIndex];
+
+                const separatorLength =
+                    separator === '\r' && mpvOutputBuffer[separatorIndex + 1] === '\n'
+                        ? 2
+                        : 1;
+
+                mpvOutputBuffer = mpvOutputBuffer.slice(
+                    separatorIndex + separatorLength
+                );
+
+                displayMpvLine(line, separator);
+            }
+        });
+
+        mpv.stdout.on('end', () => {
+            if (mpvOutputBuffer.trim()) {
+                displayMpvLine(mpvOutputBuffer, '\n');
+                mpvOutputBuffer = '';
+            }
+        });
+
+        mpv.stderr.on('data', (chunk) => {
+            saveMpvLog('stderr', chunk);
         });
 
         let ipc = null;
@@ -1041,9 +1139,34 @@ function playMedia(videoUrl, title, uploader, hasVideoFlag) {
         });
 
         mpv.on('close', (code) => {
+            if (code !== 0 && code !== null && !requestedAction) {
+                const errorLog = `${mpvErrorLog}\n${mpvOutputLog}`;
+
+                if (/HTTP error 403|403 Forbidden/i.test(errorLog)) {
+                    console.log(
+                        '\n⚠️ O YouTube recusou o acesso ao fluxo desta faixa (HTTP 403).'
+                    );
+                } else if (
+                    /No video or audio streams selected|Failed to open|Error opening/i.test(errorLog)
+                ) {
+                    console.log(
+                        '\n⚠️ Não foi possível abrir o áudio ou vídeo desta faixa.'
+                    );
+                } else if (
+                    /timed out|timeout|Could not resolve host|Network is unreachable/i.test(errorLog)
+                ) {
+                    console.log(
+                        '\n⚠️ Falha de conexão ao carregar esta faixa.'
+                    );
+                } else {
+                    console.log(
+                        `\n⚠️ Ocorreu um erro durante a reprodução (código ${code}).`
+                    );
+                }
+            }
+
             finish(code);
         });
-
         setTimeout(() => connectIpc(), 100);
     });
 }
